@@ -9,6 +9,7 @@ let loadedAssets = [];
 let endAsset = null;
 let currentIndex = 0;
 let canvas;
+let appAssetFolder = 'assets';
 
 let settingsOverlay;
 let settingsToggle;
@@ -46,6 +47,7 @@ function setup() {
     appTitleColor = getItem('appTitleColor') || DEFAULTS.appTitleColor;
     appSubtitleColor = getItem('appSubtitleColor') || DEFAULTS.appSubtitleColor;
     autoSortEnabled = getItem('autoSortEnabled') === true;
+    appAssetFolder = getItem('appAssetFolder') || 'assets';
     let savedOrder = getItem('userAssetOrder');
     if (savedOrder) userAssetOrder = savedOrder;
 
@@ -67,8 +69,40 @@ function createSplashScreen() {
         btnLoc.mousePressed(() => triggerLocalLoad());
     }
 
-    let btnDef = createButton('Cuentos de cuéntame').addClass('load-assets-btn').parent(btnContainer);
+    let defContainer = createDiv().style('display', 'flex').style('flex-direction', 'column').style('gap', '10px').parent(btnContainer);
+
+    let sel = createSelect().addClass('load-assets-select').parent(defContainer);
+    sel.style('padding', '10px');
+    sel.style('font-size', '16px');
+    sel.style('border-radius', '8px');
+    sel.style('background', '#333');
+    sel.style('color', '#fff');
+    sel.style('border', '1px solid #555');
+    sel.hide();
+
+    let btnDef = createButton('Cuentos de cuéntame').addClass('load-assets-btn').parent(defContainer);
+
+    fetch('folders.json')
+        .then(r => r.json())
+        .then(folders => {
+            if (folders && folders.length > 0) {
+                sel.show();
+                sel.option('assets (Default)', 'assets');
+                for (let f of folders) {
+                    sel.option(f, f);
+                }
+                sel.selected(appAssetFolder);
+            }
+        })
+        .catch(e => console.log("No folders.json found"));
+
     btnDef.mousePressed(() => {
+        if (sel.elt.style.display !== 'none') {
+            appAssetFolder = sel.value();
+        } else {
+            appAssetFolder = 'assets';
+        }
+        storeItem('appAssetFolder', appAssetFolder);
         storeItem('appLoadMethod', 'default');
         initApp('default');
     });
@@ -83,7 +117,7 @@ function triggerLocalLoad() {
         let newConfig = []; let fileMap = {};
         for (let file of files) {
             let name = file.name; let ext = name.split('.').pop().toLowerCase();
-            if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'webm', 'mov'].includes(ext)) {
+            if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'webm', 'mov', 'pdf'].includes(ext)) {
                 newConfig.push(name); fileMap[name] = file;
             }
         }
@@ -103,7 +137,8 @@ async function initApp(mode, fileMap = null) {
     requestFullscreenIfPossible();
     if (mode === 'default') {
         try {
-            const response = await fetch('assets.json');
+            let targetJson = (appAssetFolder === 'assets') ? 'assets.json' : `${appAssetFolder}/assets.json`;
+            const response = await fetch(targetJson);
             assetsConfig = await response.json();
         } catch (e) {
             console.error("assets.json failed to load", e);
@@ -124,28 +159,62 @@ async function initApp(mode, fileMap = null) {
 
 async function loadAllAssets(fileMap = null) {
     loadedAssets = [];
-    let validNames = [];
-    for (let filename of assetsConfig) {
-        let path = 'assets/' + filename;
-        let ext = filename.split('.').pop().toLowerCase();
-        if (fileMap && fileMap[filename]) path = URL.createObjectURL(fileMap[filename]);
+    let expandedConfig = [];
+    let pdfCache = {};
 
-        let assetObj = { name: filename, type: '', data: null, sourceUrl: path };
+    for (let entry of assetsConfig) {
+        let filename = entry;
+        let pageNum = null;
+        if (entry.includes('#page=')) {
+            let parts = entry.split('#page=');
+            filename = parts[0];
+            pageNum = parseInt(parts[1]);
+        }
+
+        let path = appAssetFolder + '/' + filename;
+        if (fileMap && fileMap[filename]) {
+            path = URL.createObjectURL(fileMap[filename]);
+        } else {
+            path = encodeURI(path);
+        }
+        let ext = filename.split('.').pop().toLowerCase();
+
         try {
             if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
-                assetObj.type = 'image';
-                assetObj.data = await new Promise((res, rej) => loadImage(path, img => res(img), err => rej(err)));
+                let img = await new Promise((res, rej) => loadImage(path, img => res(img), err => rej(err)));
+                loadedAssets.push({ name: filename, type: 'image', data: img, sourceUrl: path });
+                expandedConfig.push(entry);
             } else if (['mp4', 'webm', 'mov'].includes(ext)) {
-                assetObj.type = 'video';
-                assetObj.data = await new Promise((res) => {
+                let v = await new Promise((res) => {
                     let v = createVideo(path, () => res(v));
                     v.hide(); v.volume(1);
                 });
+                loadedAssets.push({ name: filename, type: 'video', data: v, sourceUrl: path });
+                expandedConfig.push(entry);
+            } else if (ext === 'pdf') {
+                if (!pdfCache[path]) {
+                    pdfCache[path] = await pdfjsLib.getDocument(path).promise;
+                }
+                let pdf = pdfCache[path];
+
+                if (pageNum !== null) {
+                    let pg = await renderPdfPage(pdf, pageNum);
+                    loadedAssets.push({ name: `${filename} (Pag ${pageNum})`, type: 'image', data: pg, sourceUrl: path });
+                    expandedConfig.push(entry);
+                } else {
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        let pg = await renderPdfPage(pdf, i);
+                        let pageEntry = `${filename}#page=${i}`;
+                        loadedAssets.push({ name: `${filename} (Pag ${i})`, type: 'image', data: pg, sourceUrl: path });
+                        expandedConfig.push(pageEntry);
+                    }
+                }
             }
-            if (assetObj.data) { loadedAssets.push(assetObj); validNames.push(filename); }
-        } catch (err) { }
+        } catch (err) {
+            console.error("Error loading asset:", entry, err);
+        }
     }
-    assetsConfig = validNames;
+    assetsConfig = expandedConfig;
 
     if (autoSortEnabled) {
         performAutoSort();
@@ -165,6 +234,19 @@ async function loadAllAssets(fileMap = null) {
             assetsConfig = reorderedConfig;
         }
     }
+}
+
+async function renderPdfPage(pdf, num) {
+    const page = await pdf.getPage(num);
+    const viewport = page.getViewport({ scale: 2 });
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    canvas.height = viewport.height;
+    canvas.width = viewport.width;
+    await page.render({ canvasContext: context, viewport: viewport }).promise;
+    let pg = createGraphics(canvas.width, canvas.height);
+    pg.drawingContext.drawImage(canvas, 0, 0);
+    return pg;
 }
 
 function draw() {
@@ -352,6 +434,41 @@ function refreshUIContent() {
     if (autoSortEnabled) sortBtn.addClass('active-toggle');
 
     createButton('Sync Folder').addClass('action-btn').parent(actions).mousePressed(syncFolder);
+    
+    let selectDropdown = createSelect().addClass('action-btn').style('background', '#222').style('color', 'white').style('border', '1px solid #444').parent(actions);
+    selectDropdown.option('Cuentos Locales...', '');
+    
+    fetch('folders.json')
+        .then(res => res.json())
+        .then(folders => {
+            folders.forEach(f => selectDropdown.option(f, f));
+            if (appAssetFolder && appAssetFolder !== 'assets') {
+                selectDropdown.value(appAssetFolder);
+            }
+        })
+        .catch(e => console.log('No folders.json found', e));
+        
+    selectDropdown.changed(async () => {
+        let folderName = selectDropdown.value();
+        if (folderName) {
+            try {
+                const response = await fetch(`${folderName}/assets.json`);
+                assetsConfig = await response.json();
+                appAssetFolder = folderName;
+                storeItem('appLoadMethod', 'default');
+                storeItem('appAssetFolder', folderName);
+                await loadAllAssets();
+                refreshUIContent();
+                stopCurrentAsset();
+                currentIndex = 0;
+                state = 'PLAYBACK';
+                playCurrentAsset();
+            } catch (e) {
+                alert(`Error al cargar el cuento de ${folderName}. ¿Tiene un assets.json?`);
+            }
+        }
+    });
+
     createButton('✕ Close').addClass('action-btn').parent(actions).mousePressed(toggleSettings);
 
     let initialItem = createDiv().addClass('initial-item').parent(settingsOverlay);
@@ -552,6 +669,7 @@ function resetDefaults() {
         removeItem('appLoadMethod');
         removeItem('autoSortEnabled');
         removeItem('userAssetOrder');
+        removeItem('appAssetFolder');
         location.reload();
     }
 }
@@ -597,7 +715,7 @@ async function syncFolder() {
         let newConfig = []; let fileMap = {};
         for (let file of files) {
             let name = file.name; let ext = name.split('.').pop().toLowerCase();
-            if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'webm', 'mov'].includes(ext)) {
+            if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'webm', 'mov', 'pdf'].includes(ext)) {
                 newConfig.push(name); fileMap[name] = file;
             }
         }
